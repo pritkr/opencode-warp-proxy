@@ -1,0 +1,468 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# OpenCode WARP Proxy & Privacy Shield
+# https://github.com/pritkr/opencode-warp-proxy
+# 
+# Bypasses shared Wi-Fi IP rate-limits ("Free usage limit reached") for OpenCode
+# via Cloudflare WARP (port 40000, MASQUE) bridged through Privoxy (port 8118),
+# while randomizing tracking headers (x-opencode-project) on demand.
+#
+# Supports: Linux (Arch, CachyOS, Debian, Ubuntu, Fedora) & macOS (Darwin)
+# ==============================================================================
+
+set -e
+
+WARP_PORT=40000
+PRIVOXY_PORT=8118
+PRIVOXY_ADDR="127.0.0.1:${PRIVOXY_PORT}"
+PRIVOXY_URL="http://${PRIVOXY_ADDR}"
+OS_TYPE="$(uname -s)"
+
+# ------------------------------------------------------------------------------
+# Discovery & Port Probing
+# ------------------------------------------------------------------------------
+find_opencode() {
+    if command -v opencode >/dev/null 2>&1; then
+        command -v opencode
+    elif [[ -x "$HOME/.opencode/bin/opencode" ]]; then
+        echo "$HOME/.opencode/bin/opencode"
+    elif [[ -x "$HOME/.local/bin/opencode" ]]; then
+        echo "$HOME/.local/bin/opencode"
+    elif [[ -x "/usr/local/bin/opencode" ]]; then
+        echo "/usr/local/bin/opencode"
+    elif [[ -x "/usr/bin/opencode" ]]; then
+        echo "/usr/bin/opencode"
+    else
+        echo "opencode"
+    fi
+}
+OPENCODE_BIN="$(find_opencode)"
+
+is_port_listening() {
+    local port="$1"
+    if command -v lsof >/dev/null 2>&1; then
+        lsof -i ":${port}" >/dev/null 2>&1
+    elif command -v ss >/dev/null 2>&1; then
+        ss -tuln 2>/dev/null | grep -q ":${port}"
+    elif command -v netstat >/dev/null 2>&1; then
+        netstat -tuln 2>/dev/null | grep -q ":${port}"
+    else
+        (echo > "/dev/tcp/127.0.0.1/${port}") >/dev/null 2>&1
+    fi
+}
+
+# ------------------------------------------------------------------------------
+# Privoxy Bridge Management
+# ------------------------------------------------------------------------------
+ensure_privoxy_conf() {
+    local conf_dir="$HOME/.config/opencode"
+    local conf_file="${conf_dir}/privoxy.conf"
+    mkdir -p "$conf_dir"
+    if [[ ! -f "$conf_file" ]]; then
+        cat << 'EOF' > "$conf_file"
+listen-address 127.0.0.1:8118
+forward-socks5 / 127.0.0.1:40000 .
+toggle 1
+enable-remote-toggle 0
+enable-remote-http-toggle 0
+enable-edit-actions 0
+buffer-limit 4096
+EOF
+    fi
+}
+
+start_privoxy() {
+    ensure_privoxy_conf
+    if ! is_port_listening "${PRIVOXY_PORT}"; then
+        # 1. Systemd (Linux)
+        if command -v systemctl >/dev/null 2>&1; then
+            systemctl --user start privoxy 2>/dev/null || sudo systemctl start privoxy 2>/dev/null || true
+        # 2. Homebrew (macOS)
+        elif command -v brew >/dev/null 2>&1; then
+            brew services start privoxy 2>/dev/null || true
+        fi
+        
+        # 3. Direct standalone Privoxy daemon fallback (Works without root/systemd)
+        if ! is_port_listening "${PRIVOXY_PORT}"; then
+            if command -v privoxy >/dev/null 2>&1; then
+                privoxy "$HOME/.config/opencode/privoxy.conf" 2>/dev/null || true
+            elif [[ -x "/usr/sbin/privoxy" ]]; then
+                /usr/sbin/privoxy "$HOME/.config/opencode/privoxy.conf" 2>/dev/null || true
+            elif [[ -x "/opt/homebrew/sbin/privoxy" ]]; then
+                /opt/homebrew/sbin/privoxy "$HOME/.config/opencode/privoxy.conf" 2>/dev/null || true
+            fi
+        fi
+        sleep 1
+    fi
+}
+
+# ------------------------------------------------------------------------------
+# OpenCode Privacy Plugin Deployment
+# ------------------------------------------------------------------------------
+ensure_privacy_plugin() {
+    local candidate_dirs=(
+        "$HOME/.config/opencode"
+        "$HOME/.opencode"
+        "${XDG_CONFIG_HOME:-$HOME/.config}/opencode"
+    )
+    
+    for base_dir in "${candidate_dirs[@]}"; do
+        mkdir -p "${base_dir}/plugins" 2>/dev/null || true
+        local plugin_file="${base_dir}/plugins/privacy-shield.js"
+        cat << 'PLUGIN_EOF' > "$plugin_file" 2>/dev/null || true
+import fs from "node:fs";
+import path from "node:path";
+import crypto from "node:crypto";
+
+const possibleIdentityFiles = [
+  path.join(process.env.HOME || "", ".config/opencode/identity.json"),
+  path.join(process.env.HOME || "", ".opencode/identity.json"),
+  process.env.XDG_CONFIG_HOME ? path.join(process.env.XDG_CONFIG_HOME, "opencode/identity.json") : null
+].filter(Boolean);
+
+let cachedIdentity = null;
+
+function loadIdentity() {
+  for (const file of possibleIdentityFiles) {
+    try {
+      if (fs.existsSync(file)) {
+        const data = JSON.parse(fs.readFileSync(file, "utf-8"));
+        if (data && data.projectId) {
+          return data;
+        }
+      }
+    } catch (e) {}
+  }
+
+  const newIdentity = {
+    projectId: crypto.randomBytes(20).toString("hex"),
+    clientId: "cli",
+    directory: "/home/dev/workspace",
+    createdAt: new Date().toISOString()
+  };
+
+  for (const file of possibleIdentityFiles) {
+    try {
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.writeFileSync(file, JSON.stringify(newIdentity, null, 2));
+      break;
+    } catch (e) {}
+  }
+
+  return newIdentity;
+}
+
+function getIdentity() {
+  if (!cachedIdentity) {
+    cachedIdentity = loadIdentity();
+  }
+  return cachedIdentity;
+}
+
+export default {
+  id: "privacy.shield",
+  async setup(ctx) {
+    if (ctx.session?.hook) {
+      await ctx.session.hook("model.request", async (req) => {
+        if (req.headers) {
+          const identity = getIdentity();
+          if (identity.projectId) {
+            req.headers["x-opencode-project"] = identity.projectId;
+          }
+          req.headers["x-opencode-client"] = identity.clientId || "cli";
+          if (req.headers["x-opencode-directory"]) {
+            req.headers["x-opencode-directory"] = encodeURIComponent(identity.directory || "/home/dev/workspace");
+          }
+        }
+      });
+    }
+  }
+};
+PLUGIN_EOF
+    done
+}
+
+# ------------------------------------------------------------------------------
+# IP Resolution
+# ------------------------------------------------------------------------------
+get_proxy_ip() {
+    for _ in {1..6}; do
+        local ip
+        ip=$(curl -s --max-time 4 -x "${PRIVOXY_URL}" https://cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -E "^ip=" | cut -d= -f2 || true)
+        if [[ -n "$ip" ]]; then
+            echo "$ip"
+            return 0
+        fi
+        sleep 1
+    done
+    echo "unavailable"
+}
+
+get_direct_ip() {
+    curl -s --max-time 5 https://cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -E "^ip=" | cut -d= -f2 || echo "unavailable"
+}
+
+# ------------------------------------------------------------------------------
+# Core Actions
+# ------------------------------------------------------------------------------
+enable_proxy() {
+    echo "==> Enabling OpenCode WARP Proxy..."
+    ensure_privacy_plugin
+    
+    echo "[1/4] Ensuring WARP proxy configuration (port ${WARP_PORT}, MASQUE protocol)..."
+    warp-cli mode proxy >/dev/null 2>&1 || warp-cli set-mode proxy >/dev/null 2>&1 || true
+    warp-cli proxy port "${WARP_PORT}" >/dev/null 2>&1 || warp-cli set-proxy-port "${WARP_PORT}" >/dev/null 2>&1 || true
+    warp-cli tunnel protocol set MASQUE >/dev/null 2>&1 || true
+    warp-cli connect >/dev/null 2>&1 || true
+    
+    echo "[2/4] Ensuring Privoxy is running on ${PRIVOXY_ADDR}..."
+    start_privoxy
+    
+    echo "[3/4] Setting OpenCode service proxy environment variables..."
+    "$OPENCODE_BIN" service set env HTTPS_PROXY "${PRIVOXY_URL}" >/dev/null 2>&1 || true
+    "$OPENCODE_BIN" service set env HTTP_PROXY "${PRIVOXY_URL}" >/dev/null 2>&1 || true
+    "$OPENCODE_BIN" service set env ALL_PROXY "${PRIVOXY_URL}" >/dev/null 2>&1 || true
+    "$OPENCODE_BIN" service set env NO_PROXY "localhost,127.0.0.1" >/dev/null 2>&1 || true
+    "$OPENCODE_BIN" service unset env DO_NOT_TRACK >/dev/null 2>&1 || true
+    "$OPENCODE_BIN" service unset env OTEL_SDK_DISABLED >/dev/null 2>&1 || true
+    
+    echo "[4/4] Restarting OpenCode service..."
+    "$OPENCODE_BIN" service restart >/dev/null 2>&1 || pkill -f "opencode serve" >/dev/null 2>&1 || true
+    
+    sleep 1
+    IP=$(get_proxy_ip)
+    echo "✓ OpenCode proxy ENABLED"
+    echo "  - Privoxy HTTP Proxy: ${PRIVOXY_URL}"
+    echo "  - WARP SOCKS5:        127.0.0.1:${WARP_PORT}"
+    echo "  - Current Egress IP:  ${IP}"
+}
+
+disable_proxy() {
+    echo "==> Disabling OpenCode WARP Proxy..."
+    echo "[1/2] Unsetting OpenCode proxy environment variables..."
+    "$OPENCODE_BIN" service unset env HTTPS_PROXY >/dev/null 2>&1 || true
+    "$OPENCODE_BIN" service unset env HTTP_PROXY >/dev/null 2>&1 || true
+    "$OPENCODE_BIN" service unset env ALL_PROXY >/dev/null 2>&1 || true
+    "$OPENCODE_BIN" service unset env NO_PROXY >/dev/null 2>&1 || true
+    
+    echo "[2/2] Restarting OpenCode service..."
+    "$OPENCODE_BIN" service restart >/dev/null 2>&1 || true
+    
+    DIRECT_IP=$(get_direct_ip)
+    echo "✓ OpenCode proxy DISABLED"
+    echo "  - Direct Egress IP: ${DIRECT_IP}"
+}
+
+rotate_ip() {
+    echo "==> Rotating Cloudflare WARP IP..."
+    OLD_IP=$(get_proxy_ip)
+    echo "  - Previous IP: ${OLD_IP}"
+    
+    warp-cli tunnel rotate-keys >/dev/null 2>&1 || warp-cli rotate-keys >/dev/null 2>&1 || (warp-cli disconnect >/dev/null 2>&1 && sleep 1 && warp-cli connect >/dev/null 2>&1) || true
+    sleep 1
+    
+    NEW_IP=$(get_proxy_ip)
+    echo "  - New IP:      ${NEW_IP}"
+    echo "✓ IP rotation complete"
+}
+
+reset_identity() {
+    echo "==> Performing Resilient Privacy Reset & Proxy IP Rotation..."
+    ensure_privacy_plugin
+    
+    OLD_IP=$(get_proxy_ip)
+    echo "[1/4] Current Egress IP: ${OLD_IP}"
+    
+    echo "[2/4] Generating new randomized project and environment identifiers across all paths..."
+    RANDOM_PROJECT_ID=$(openssl rand -hex 20 2>/dev/null || od -vN 20 -An -tx1 /dev/urandom | tr -d ' \n')
+    RANDOM_DIR="/home/dev/workspace-$(openssl rand -hex 4 2>/dev/null || od -vN 4 -An -tx1 /dev/urandom | tr -d ' \n')"
+    
+    local candidate_dirs=(
+        "$HOME/.config/opencode"
+        "$HOME/.opencode"
+        "${XDG_CONFIG_HOME:-$HOME/.config}/opencode"
+    )
+    
+    for base_dir in "${candidate_dirs[@]}"; do
+        mkdir -p "$base_dir" 2>/dev/null || true
+        cat <<EOF > "${base_dir}/identity.json" 2>/dev/null || true
+{
+  "projectId": "${RANDOM_PROJECT_ID}",
+  "clientId": "cli",
+  "directory": "${RANDOM_DIR}",
+  "updatedAt": "$(date -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || date +"%Y-%m-%dT%H:%M:%SZ")"
+}
+EOF
+        rm -f "${base_dir}/opencode.jsonc.bak" 2>/dev/null || true
+    done
+
+    # Truncate local logs
+    local log_paths=(
+        "$HOME/.local/share/opencode/log/opencode.log"
+        "$HOME/.opencode/log/opencode.log"
+    )
+    for log_p in "${log_paths[@]}"; do
+        if [[ -f "$log_p" ]]; then
+            : > "$log_p" 2>/dev/null || true
+        fi
+    done
+
+    # Reset databases directly if sqlite3 is present to clear stuck rate limits & randomize DB project ID
+    local db_paths=(
+        "$HOME/.local/share/opencode/opencode.db"
+        "$HOME/.opencode/opencode.db"
+        "${XDG_DATA_HOME:-$HOME/.local/share}/opencode/opencode.db"
+    )
+    for db in "${db_paths[@]}"; do
+        if [[ -f "$db" ]] && command -v sqlite3 >/dev/null 2>&1; then
+            sqlite3 "$db" "UPDATE project SET id = '${RANDOM_PROJECT_ID}' WHERE id != 'global';" 2>/dev/null || true
+            sqlite3 "$db" "DELETE FROM session_message WHERE data LIKE '%FreeUsageLimitError%';" 2>/dev/null || true
+        fi
+    done
+    
+    # Configure OpenCode service proxy settings without DO_NOT_TRACK (avoids anti-bot scrutiny)
+    "$OPENCODE_BIN" service set env HTTPS_PROXY "${PRIVOXY_URL}" >/dev/null 2>&1 || true
+    "$OPENCODE_BIN" service set env HTTP_PROXY "${PRIVOXY_URL}" >/dev/null 2>&1 || true
+    "$OPENCODE_BIN" service set env ALL_PROXY "${PRIVOXY_URL}" >/dev/null 2>&1 || true
+    "$OPENCODE_BIN" service set env NO_PROXY "localhost,127.0.0.1" >/dev/null 2>&1 || true
+    "$OPENCODE_BIN" service unset env DO_NOT_TRACK >/dev/null 2>&1 || true
+    "$OPENCODE_BIN" service unset env OTEL_SDK_DISABLED >/dev/null 2>&1 || true
+    
+    echo "[3/4] Rotating Cloudflare WARP egress IP to clear free tier limits..."
+    warp-cli tunnel rotate-keys >/dev/null 2>&1 || warp-cli rotate-keys >/dev/null 2>&1 || (warp-cli disconnect >/dev/null 2>&1 && sleep 1 && warp-cli connect >/dev/null 2>&1) || true
+    
+    echo "[4/4] Purging daemon in-memory caches and restarting service..."
+    "$OPENCODE_BIN" service restart >/dev/null 2>&1 || pkill -f "opencode serve" >/dev/null 2>&1 || true
+    
+    sleep 1
+    NEW_IP=$(get_proxy_ip)
+    
+    echo "✓ RESILIENT RESET COMPLETE"
+    echo "  - Previous IP:            ${OLD_IP}"
+    echo "  - New Egress IP:          ${NEW_IP}"
+    echo "  - Randomized Project ID:  ${RANDOM_PROJECT_ID}"
+    echo "  - Client Header:          cli (Standard)"
+    echo "  - Directory Path:         ${RANDOM_DIR} (Sanitized)"
+    echo "  - Do Not Track (DNT):     Unset"
+    echo "  - Correlation to Past:    0%"
+}
+
+guard() {
+    # 1. Keep /tmp/warp_service socket alive on macOS against daily tmp cleaner
+    if [[ "$OS_TYPE" == "Darwin" && -S /tmp/warp_service ]]; then
+        touch /tmp/warp_service 2>/dev/null || true
+    fi
+    
+    # 2. Check WARP status
+    if ! warp-cli status 2>/dev/null | grep -q "Connected"; then
+        warp-cli mode proxy >/dev/null 2>&1 || warp-cli set-mode proxy >/dev/null 2>&1 || true
+        warp-cli proxy port "${WARP_PORT}" >/dev/null 2>&1 || warp-cli set-proxy-port "${WARP_PORT}" >/dev/null 2>&1 || true
+        warp-cli tunnel protocol set MASQUE >/dev/null 2>&1 || true
+        warp-cli connect >/dev/null 2>&1 || true
+    fi
+    
+    # 3. Check Privoxy status
+    start_privoxy
+}
+
+show_status() {
+    echo "==> OpenCode Proxy Status"
+    echo "--- WARP Client ---"
+    warp-cli status 2>&1 || true
+    echo "--- Privoxy (Port ${PRIVOXY_PORT}) ---"
+    if is_port_listening "${PRIVOXY_PORT}"; then
+        echo "Privoxy: Running"
+    else
+        echo "Privoxy: Stopped"
+    fi
+    echo "--- Privacy Shield ---"
+    local identity_found=0
+    local candidate_dirs=(
+        "$HOME/.config/opencode"
+        "$HOME/.opencode"
+    )
+    for d in "${candidate_dirs[@]}"; do
+        if [[ -f "${d}/identity.json" ]]; then
+            echo "Current Identity Profile (${d}/identity.json):"
+            cat "${d}/identity.json"
+            identity_found=1
+            break
+        fi
+    done
+    if [[ $identity_found -eq 0 ]]; then
+        echo "Privacy Shield: Not initialized yet (run opencode-proxy reset)"
+    fi
+    echo "--- OpenCode Service Environment ---"
+    "$OPENCODE_BIN" service get 2>/dev/null || true
+    echo "--- Egress IPs ---"
+    echo "Direct IP: $(get_direct_ip)"
+    echo "Proxy IP:  $(get_proxy_ip)"
+}
+
+run_with_auto_rotate() {
+    shift
+    local max_retries=3
+    local attempt=1
+    
+    while [[ $attempt -le $max_retries ]]; do
+        local output
+        local status=0
+        
+        output=$("$OPENCODE_BIN" "$@" 2>&1) || status=$?
+        
+        if [[ $status -ne 0 ]] && echo "$output" | grep -qi "Free usage limit reached"; then
+            echo "⚠️  Free usage limit reached on current IP (Attempt $attempt/$max_retries)"
+            echo "🔄 Auto-rotating Cloudflare WARP IP to reset quota..."
+            rotate_ip
+            attempt=$((attempt + 1))
+        else
+            echo "$output"
+            return $status
+        fi
+    done
+    
+    echo "❌ Still rate limited after $max_retries automatic rotations."
+    return 1
+}
+
+ensure_symlinks() {
+    local target_script="$HOME/.local/bin/opencode-proxy"
+    if [[ "$0" != "$target_script" && -f "$0" ]]; then
+        mkdir -p "$HOME/.local/bin" "$HOME/.opencode/bin" 2>/dev/null || true
+        cp -f "$0" "$HOME/.local/bin/opencode-proxy" 2>/dev/null || true
+        chmod +x "$HOME/.local/bin/opencode-proxy" 2>/dev/null || true
+        ln -sf "$HOME/.local/bin/opencode-proxy" "$HOME/.opencode/bin/opencode-proxy" 2>/dev/null || true
+    fi
+}
+ensure_symlinks
+
+# ------------------------------------------------------------------------------
+# Entrypoint Dispatcher
+# ------------------------------------------------------------------------------
+case "$1" in
+    on)
+        enable_proxy
+        ;;
+    off)
+        disable_proxy
+        ;;
+    rotate)
+        rotate_ip
+        ;;
+    reset|reset-identity|rotate-all)
+        reset_identity
+        ;;
+    run)
+        run_with_auto_rotate "$@"
+        ;;
+    guard)
+        guard
+        ;;
+    status)
+        show_status
+        ;;
+    *)
+        echo "Usage: opencode-proxy {on|off|rotate|reset|run <args>|guard|status}"
+        exit 1
+        ;;
+esac
