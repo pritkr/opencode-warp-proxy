@@ -1,101 +1,195 @@
-# OpenCode WARP Proxy & Privacy Shield 🛡️⚡
+<p align="center">
+  <img src="assets/banner.svg" alt="OpenCode WARP Proxy &amp; Privacy Shield Banner" width="100%" />
+</p>
 
-A resilient, cross-platform proxy bridge and privacy shield for [OpenCode](https://opencode.ai). Bypasses shared campus/office Wi-Fi IP rate-limits (`Free usage limit reached / Resets at 5:30 AM`) using **Cloudflare WARP** via a local **Privoxy** bridge, while randomizing tracking identifiers (`x-opencode-project`) on demand.
+<p align="center">
+  <a href="https://github.com/pritkr/opencode-warp-proxy/releases"><img src="https://img.shields.io/badge/version-1.0.0-blue.svg?style=flat-square" alt="Version" /></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green.svg?style=flat-square" alt="License" /></a>
+  <img src="https://img.shields.io/badge/platform-Linux%20%7C%20macOS-informational.svg?style=flat-square" alt="Platform" />
+  <img src="https://img.shields.io/badge/warp--cli-MASQUE%20%2840000%29-orange.svg?style=flat-square" alt="WARP MASQUE" />
+  <img src="https://img.shields.io/badge/privoxy-SOCKS5%20Bridge%20%288118%29-purple.svg?style=flat-square" alt="Privoxy Bridge" />
+  <img src="https://img.shields.io/badge/tested%20on-Arch%20%7C%20CachyOS%20%7C%20macOS-brightgreen.svg?style=flat-square" alt="Tested Environments" />
+</p>
 
-Works seamlessly on **macOS (Darwin)** and **Linux (Arch, CachyOS, Debian, Ubuntu, Fedora)**.
+<h3 align="center">
+  A resilient, cross-platform proxy bridge and zero-correlation privacy shield for <a href="https://opencode.ai">OpenCode</a>.
+</h3>
 
----
-
-## The Problem
-
-* **Shared Public IP Exhaustion:** On campus, dorm, or enterprise Wi-Fi, hundreds of devices share a single public NAT IP address. OpenCode rate-limits free-tier models (e.g. `opencode/deepseek-v4.1-flash-free`) by public IP in Upstash Redis. When the shared IP runs out of quota, everyone on the network gets blocked.
-* **Bun's SOCKS5 Incompatibility:** OpenCode runs on the Bun JavaScript runtime. Bun's native `fetch()` does not support `socks5://` proxy schemes (`UnsupportedProxyProtocol`).
-* **Session Correlation:** OpenCode attaches persistent project identifiers (`x-opencode-project`) and client headers across requests, preventing users from resetting their rate-limit bucket.
-* **Anti-Bot Throttling:** Setting `DO_NOT_TRACK: 1` or deleting standard headers triggers anti-bot scrutiny on the inference gateway.
-
----
-
-## The Solution
-
-```
-┌──────────────────────────┐
-│  OpenCode CLI / Daemon   │  (Bun Runtime)
-│  x-opencode-project:     │
-│  [Randomized 40-char ID] │
-└─────────────┬────────────┘
-              │ HTTP_PROXY (http://127.0.0.1:8118)
-              ▼
-┌──────────────────────────┐
-│      Privoxy Bridge      │  Translates HTTP Proxy -> SOCKS5
-│     (127.0.0.1:8118)     │
-└─────────────┬────────────┘
-              │ forward-socks5 (127.0.0.1:40000)
-              ▼
-┌──────────────────────────┐
-│   Cloudflare WARP CLI    │  Proxy Mode (Port 40000, MASQUE)
-│     (127.0.0.1:40000)    │  Rotatable Egress Keys
-└─────────────┬────────────┘
-              │
-              ▼
-┌──────────────────────────┐
-│   Cloudflare Anycast     │  Brand new public IP per rotation
-│   Inference Gateway      │  Zero rate-limit bucket
-└──────────────────────────┘
-```
-
-1. **WARP in Proxy Mode:** Runs Cloudflare WARP locally on port `40000` via MASQUE protocol without hijacking your entire system's default network routing.
-2. **Privoxy SOCKS5 Bridge:** Privoxy listens on port `8118` and transparently converts OpenCode's HTTP requests to WARP's SOCKS5 interface.
-3. **On-Demand Key Rotation (`reset`):** Generates new WireGuard/MASQUE cryptographic keys on demand (`warp-cli tunnel rotate-keys`), immediately acquiring a fresh public egress IP and resetting the rate-limit budget.
-4. **Privacy Shield Plugin:** Injects standard-format, valid, but strictly randomized 40-character project IDs into outgoing requests. The server sees a 100% normal, valid client with **0% correlation** to past sessions. Identifiers stay stable during active sessions and only rotate when you run `opencode-proxy reset`.
+<p align="center">
+  Eliminates shared campus Wi-Fi rate limits (<code>Free usage limit reached / Resets at 5:30 AM</code>) using <b>Cloudflare WARP</b> via a local <b>Privoxy</b> translation bridge, while dynamically randomizing project tracking identifiers on demand.
+</p>
 
 ---
 
-## Quick Install (One-Liner)
+## ⚡ Quick Start (One-Liner)
 
-Run this command in your terminal:
+Install and activate on **Linux** (CachyOS, Arch, Ubuntu, Debian, Fedora) or **macOS**:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/pritkr/opencode-warp-proxy/main/install.sh | bash
 ```
 
-*Auto-detects your OS, installs Privoxy if missing, sets up the binary, deploys the plugin, and runs an initial reset.*
+> [!TIP]
+> This command auto-detects your OS, installs/configures Privoxy, deploys the `opencode-proxy` CLI to `~/.local/bin`, installs the privacy shield plugin, and performs an initial IP rotation & reset.
 
 ---
 
-## Command Reference
+## 📋 Table of Contents
 
-| Command | Description |
-| :--- | :--- |
-| `opencode-proxy reset` | **Full Reset:** Generates a new random project ID, rotates Cloudflare IP, flushes memory caches, and restarts the daemon. |
-| `opencode-proxy rotate` | Rotates Cloudflare WARP egress IP only without restarting OpenCode. |
-| `opencode-proxy status` | Displays WARP status, Privoxy status, egress IPs, and current active identity profile. |
-| `opencode-proxy on` | Enables proxy mode in OpenCode and starts Privoxy & WARP. |
-| `opencode-proxy off` | Disables proxy environment variables and routes OpenCode directly. |
-| `opencode-proxy run <args>` | Wraps `opencode` with automatic 3x retry and IP rotation on rate limits. |
+- [The Problem](#-the-problem)
+- [How It Works](#-how-it-works)
+- [Command Reference](#-command-reference)
+- [The `reset` Command Explained](#-the-reset-command-explained)
+- [Automatic Retry Runner](#-automatic-retry-runner-run)
+- [Model Selection Gotcha](#-model-selection-gotcha)
+- [Architecture & File Structure](#-architecture--file-structure)
+- [Compatibility](#-compatibility)
+- [License](#-license)
 
 ---
 
-## Model Selection Gotcha
+## 🚨 The Problem
 
-For free-tier usage, use the base model:
+1. **Shared IP Depletion:** On campus, dorm, or office Wi-Fi, hundreds of students share a single public NAT IPv4 address. OpenCode rate-limits free-tier models (such as `opencode/deepseek-v4.1-flash-free`) by public IP in Upstash Redis. When the shared IP runs out of hourly quota, everyone on that Wi-Fi gets blocked.
+2. **Bun's SOCKS5 Incompatibility:** OpenCode runs on the Bun runtime. Bun's native `fetch()` does not support `socks5://` proxy schemes and throws `UnsupportedProxyProtocol`.
+3. **Session Correlation:** OpenCode attaches persistent project identifiers (`x-opencode-project`) and directory paths across requests, preventing users from separating conversations or refreshing their rate-limit bucket.
+4. **Anti-Bot Throttling:** Deleting headers entirely or setting `DO_NOT_TRACK: 1` triggers anti-bot scrutiny on the Cloudflare inference gateway, causing stricter rate limits.
+
+---
+
+## 🛠️ How It Works
+
+```mermaid
+flowchart TD
+    subgraph Client["OpenCode Client (Bun Runtime)"]
+        CLI["OpenCode CLI / TUI / Daemon"]
+        Plugin["Privacy Shield Plugin\n(randomizes x-opencode-project)"]
+    end
+
+    subgraph Bridge["Local Proxy Translation Layer"]
+        Privoxy["Privoxy HTTP Bridge\n(127.0.0.1:8118)"]
+        WARP["Cloudflare WARP Client\n(Port 40000, MASQUE SOCKS5)"]
+    end
+
+    subgraph Cloudflare["Cloudflare Edge & Gateway"]
+        Anycast["Rotatable Public Anycast IP\n(warp-cli tunnel rotate-keys)"]
+        Worker["OpenCode Inference Worker\n(Fresh Quota Bucket)"]
+    end
+
+    CLI -->|model.request| Plugin
+    Plugin -->|HTTP Proxy| Privoxy
+    Privoxy -->|forward-socks5| WARP
+    WARP -->|WireGuard / MASQUE| Anycast
+    Anycast --> Worker
+```
+
+1. **WARP in Proxy Mode:** Runs Cloudflare WARP locally on port `40000` via MASQUE protocol without hijacking your entire system's default network routing.
+2. **Privoxy SOCKS5 Bridge:** Privoxy listens on port `8118` and transparently translates OpenCode's HTTP requests to WARP's SOCKS5 interface.
+3. **On-Demand Key Rotation (`reset`):** Generates new WireGuard/MASQUE cryptographic keys (`warp-cli tunnel rotate-keys`), immediately acquiring a fresh public egress IP and clearing the rate-limit budget.
+4. **Privacy Shield Plugin:** Injects standard-format, valid, but strictly randomized 40-character project IDs into outgoing requests. The server sees a 100% normal, valid client with **0% correlation** to past sessions.
+
+---
+
+## 💻 Command Reference
+
+The `opencode-proxy` CLI provides simple verbs to manage your connection:
+
 ```bash
-opencode run -m opencode/deepseek-v4.1-flash-free "Hello"
+opencode-proxy <command>
+```
+
+| Command | Action |
+| :--- | :--- |
+| **`reset`** | **Full Privacy & Quota Reset:** Generates a new random project ID, rotates Cloudflare IP, unsets anti-bot flags, flushes daemon caches, and restarts OpenCode. |
+| **`rotate`** | Rotates Cloudflare WARP egress IP only without restarting the OpenCode service. |
+| **`status`** | Displays WARP connection status, Privoxy state, direct & proxy egress IPs, and current active identity profile. |
+| **`on`** | Configures WARP proxy mode, starts Privoxy, sets OpenCode daemon proxy environment variables, and enables the privacy plugin. |
+| **`off`** | Disables proxy environment variables in OpenCode and routes traffic directly. |
+| **`run <args>`** | Runs an OpenCode prompt with automatic 3x retry and IP rotation if a rate limit is hit. |
+
+---
+
+## 🔄 The `reset` Command Explained
+
+Whenever you hit a limit or want to start a completely fresh, uncorrelatable session, run:
+
+```bash
+opencode-proxy reset
+```
+
+Here is exactly what happens under the hood:
+
+```
+[opencode-proxy reset]
+        │
+        ├── 1. Generate Brand New Random Identifiers
+        │      ├── Project ID: Fresh 40-character hex (e.g. 98105e3cd0186265...)
+        │      └── Workspace:  Sanitized fake directory (/home/dev/workspace-xxxx)
+        │
+        ├── 2. Clean Environment & Telemetry Flags
+        │      ├── Unset DO_NOT_TRACK & OTEL (prevents gateway anti-bot throttling)
+        │      └── Truncate local opencode.log & clean backup configs
+        │
+        ├── 3. Rotate Cloudflare WARP Egress IP (warp-cli tunnel rotate-keys)
+        │      └── Allocates a brand new public IP with an instant 0/empty quota bucket
+        │
+        └── 4. Restart Background Daemon (opencode service restart)
+               └── Flushes in-memory connection pools & loads the new identity
+```
+
+> [!NOTE]
+> **Stability Policy:** Identifiers stay **rock-solid and constant** during your normal active chats so multi-turn sessions, tools, and context caches work seamlessly. They **only** rotate when you run `opencode-proxy reset`.
+
+---
+
+## 🤖 Automatic Retry Runner (`run`)
+
+You can wrap any OpenCode command to automatically detect rate limits, rotate the IP, and retry:
+
+```bash
+opencode-proxy run run -m opencode/deepseek-v4.1-flash-free "Your prompt here"
+```
+
+If OpenCode exits with `Free usage limit reached`, the script intercepts the error, calls `rotate_ip` to grab a fresh Cloudflare egress IP, and retries up to 3 times automatically.
+
+---
+
+## ⚠️ Model Selection Gotcha
+
+For free-tier usage without an OpenCode Go subscription, always use the standard base model:
+
+```bash
+opencode run -m opencode/deepseek-v4.1-flash-free "Your message"
 ```
 
 > [!WARNING]
-> Avoid variants like `#high` or `#max` (e.g. `deepseek-v4.1-flash-free#max`) on the free tier. These compute-heavy variants trigger OpenCode Go subscription requirements (`FreeUsageLimitError`) regardless of IP.
+> Avoid compute-heavy model variants like `#high` or `#max` (e.g. `deepseek-v4.1-flash-free#max`) on the free tier. These variants trigger OpenCode Go subscription requirements (`FreeUsageLimitError`) regardless of IP.
 
 ---
 
-## Architecture & File Locations
+## 📁 Architecture & File Structure
 
-* **CLI Binary:** `~/.local/bin/opencode-proxy` (symlinked to `~/.opencode/bin/opencode-proxy`)
-* **Privacy Plugin:** `~/.config/opencode/plugins/privacy-shield.js` (and `~/.opencode/plugins/`)
-* **Active Identity:** `~/.config/opencode/identity.json`
-* **Privoxy Config:** `~/.config/opencode/privoxy.conf` (or `/opt/homebrew/etc/privoxy/config`)
+| Path | Purpose |
+| :--- | :--- |
+| `~/.local/bin/opencode-proxy` | Main control script (symlinked to `~/.opencode/bin/opencode-proxy`). |
+| `~/.config/opencode/plugins/privacy-shield.js` | OpenCode plugin that hooks `model.request` and injects randomized headers. |
+| `~/.config/opencode/identity.json` | Stores the active randomized 40-char project ID and directory token. |
+| `~/.config/opencode/privoxy.conf` | User-space Privoxy configuration with `forward-socks5 / 127.0.0.1:40000 .`. |
 
 ---
 
-## License
+## 🐧 Compatibility
 
-[MIT](LICENSE)
+- **Linux:**
+  - Arch Linux / CachyOS / Manjaro (`pacman -S privoxy`)
+  - Ubuntu / Debian / Pop!_OS (`apt-get install privoxy`)
+  - Fedora / RHEL (`dnf install privoxy`)
+- **macOS:**
+  - macOS Sequoia, Sonoma, Ventura (`brew install privoxy`)
+  - Native Apple Silicon (M1/M2/M3/M4) and Intel (x86_64)
+
+---
+
+## 📄 License
+
+This project is licensed under the [MIT License](LICENSE).
