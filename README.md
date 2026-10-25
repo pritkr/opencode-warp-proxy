@@ -100,8 +100,9 @@ opencode-proxy <command>
 
 | Command | Action |
 | :--- | :--- |
-| **`reset`** | **Full Privacy & Quota Reset:** Generates a new random project ID, rotates Cloudflare IP, unsets anti-bot flags, flushes daemon caches, and restarts OpenCode. |
-| **`rotate`** | Rotates Cloudflare WARP egress IP only without restarting the OpenCode service. |
+| **`reset`** | **Full Privacy & Quota Reset:** Generates a new random project ID, rotates Cloudflare IP, flushes memory caches, restarts daemon, and **actively tests up to 8 IPs** until an unexhausted quota is confirmed. |
+| **`rotate`** | Rotates Cloudflare WARP egress IP and verifies the new IP has fresh quota (retrying automatically if exhausted). |
+| **`test`** | **Quota Diagnostic:** Probes the current egress IP against OpenCode and reports whether quota is active or exhausted. |
 | **`status`** | Displays WARP connection status, Privoxy state, direct & proxy egress IPs, and current active identity profile. |
 | **`on`** | Configures WARP proxy mode, starts Privoxy, sets OpenCode daemon proxy environment variables, and enables the privacy plugin. |
 | **`off`** | Disables proxy environment variables in OpenCode and routes traffic directly. |
@@ -131,10 +132,15 @@ Here is exactly what happens under the hood:
         │      └── Truncate local opencode.log & clean backup configs
         │
         ├── 3. Rotate Cloudflare WARP Egress IP (warp-cli tunnel rotate-keys)
-        │      └── Allocates a brand new public IP with an instant 0/empty quota bucket
+        │      └── Requests a fresh Anycast public IP from Cloudflare's regional pool
         │
-        └── 4. Restart Background Daemon (opencode service restart)
-               └── Flushes in-memory connection pools & loads the new identity
+        ├── 4. Restart Background Daemon (opencode service restart)
+        │      └── Flushes in-memory connection pools & loads the new identity
+        │
+        └── 5. Multi-Attempt Quota Verification (Self-Healing Loop)
+               └── Actively probes the new IP against OpenCode. If another user
+                   in the region exhausted that specific IP, it automatically
+                   rotates again (up to 8 attempts) until a 100% clean IP is locked in!
 ```
 
 > [!NOTE]

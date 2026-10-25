@@ -183,7 +183,7 @@ PLUGIN_EOF
 }
 
 # ------------------------------------------------------------------------------
-# IP Resolution
+# IP Resolution & Active Quota Verification
 # ------------------------------------------------------------------------------
 get_proxy_ip() {
     for _ in {1..6}; do
@@ -200,6 +200,51 @@ get_proxy_ip() {
 
 get_direct_ip() {
     curl -s --max-time 5 https://cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -E "^ip=" | cut -d= -f2 || echo "unavailable"
+}
+
+trigger_key_rotation() {
+    warp-cli tunnel rotate-keys >/dev/null 2>&1 || \
+    warp-cli rotate-keys >/dev/null 2>&1 || \
+    (warp-cli disconnect >/dev/null 2>&1 && sleep 1 && warp-cli connect >/dev/null 2>&1) || true
+}
+
+test_ip_quota() {
+    local test_out
+    local rc=0
+    test_out=$("$OPENCODE_BIN" run -m opencode/deepseek-v4.1-flash-free "1+1" 2>&1) || rc=$?
+    if [[ $rc -eq 0 ]] && ! echo "$test_out" | grep -qi -E "Free usage limit reached|used today's free messages"; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+# Actively probes the egress IP against OpenCode and auto-rotates if the IP is already exhausted
+ensure_unexhausted_ip() {
+    local max_attempts="${1:-8}"
+    local attempt=1
+    
+    while [[ $attempt -le $max_attempts ]]; do
+        local cur_ip
+        cur_ip=$(get_proxy_ip)
+        printf "  [%d/%d] Probing IP %s ... " "$attempt" "$max_attempts" "$cur_ip"
+        
+        if test_ip_quota; then
+            echo "✓ ACTIVE (0 rate limits, fresh quota)"
+            return 0
+        else
+            echo "⚠️ EXHAUSTED by another user in region."
+            if [[ $attempt -lt $max_attempts ]]; then
+                echo "      Rotating to fresh Cloudflare WARP IP..."
+                trigger_key_rotation
+                sleep 2
+            fi
+            attempt=$((attempt + 1))
+        fi
+    done
+    
+    echo "❌ Warning: Unable to confirm an unexhausted IP after $max_attempts attempts."
+    return 1
 }
 
 # ------------------------------------------------------------------------------
@@ -258,11 +303,12 @@ rotate_ip() {
     OLD_IP=$(get_proxy_ip)
     echo "  - Previous IP: ${OLD_IP}"
     
-    warp-cli tunnel rotate-keys >/dev/null 2>&1 || warp-cli rotate-keys >/dev/null 2>&1 || (warp-cli disconnect >/dev/null 2>&1 && sleep 1 && warp-cli connect >/dev/null 2>&1) || true
+    trigger_key_rotation
     sleep 1
     
+    ensure_unexhausted_ip 8
     NEW_IP=$(get_proxy_ip)
-    echo "  - New IP:      ${NEW_IP}"
+    echo "  - Verified Clean IP: ${NEW_IP}"
     echo "✓ IP rotation complete"
 }
 
@@ -271,9 +317,9 @@ reset_identity() {
     ensure_privacy_plugin
     
     OLD_IP=$(get_proxy_ip)
-    echo "[1/4] Current Egress IP: ${OLD_IP}"
+    echo "[1/5] Current Egress IP: ${OLD_IP}"
     
-    echo "[2/4] Generating new randomized project and environment identifiers across all paths..."
+    echo "[2/5] Generating new randomized project and environment identifiers across all paths..."
     RANDOM_PROJECT_ID=$(openssl rand -hex 20 2>/dev/null || od -vN 20 -An -tx1 /dev/urandom | tr -d ' \n')
     RANDOM_DIR="/home/dev/workspace-$(openssl rand -hex 4 2>/dev/null || od -vN 4 -An -tx1 /dev/urandom | tr -d ' \n')"
     
@@ -328,31 +374,15 @@ EOF
     "$OPENCODE_BIN" service unset env DO_NOT_TRACK >/dev/null 2>&1 || true
     "$OPENCODE_BIN" service unset env OTEL_SDK_DISABLED >/dev/null 2>&1 || true
     
-    echo "[3/4] Rotating Cloudflare WARP egress IP to clear free tier limits..."
-    warp-cli tunnel rotate-keys >/dev/null 2>&1 || warp-cli rotate-keys >/dev/null 2>&1 || (warp-cli disconnect >/dev/null 2>&1 && sleep 1 && warp-cli connect >/dev/null 2>&1) || true
+    echo "[3/5] Rotating Cloudflare WARP egress IP to clear free tier limits..."
+    trigger_key_rotation
     
     echo "[4/5] Purging daemon in-memory caches and restarting service..."
     "$OPENCODE_BIN" service restart >/dev/null 2>&1 || pkill -f "opencode serve" >/dev/null 2>&1 || true
     sleep 1
 
-    # 4. Verify that new IP has fresh quota, otherwise auto-rotate until clean
-    echo "[5/5] Verifying quota on new IP..."
-    local max_attempts=5
-    local attempt=1
-    while [[ $attempt -le $max_attempts ]]; do
-        local test_out
-        local rc=0
-        test_out=$("$OPENCODE_BIN" run -m opencode/deepseek-v4.1-flash-free "1+1" 2>&1) || rc=$?
-        if [[ $rc -eq 0 ]] && ! echo "$test_out" | grep -qi "Free usage limit reached"; then
-            echo "  ✓ Confirmed: Egress IP has 100% clean quota"
-            break
-        else
-            echo "  ⚠️ IP had exhausted pooled quota. Auto-rotating to next IP (Attempt $attempt/$max_attempts)..."
-            warp-cli tunnel rotate-keys >/dev/null 2>&1 || warp-cli rotate-keys >/dev/null 2>&1 || (warp-cli disconnect >/dev/null 2>&1 && sleep 1 && warp-cli connect >/dev/null 2>&1) || true
-            sleep 2
-            attempt=$((attempt + 1))
-        fi
-    done
+    echo "[5/5] Actively testing & verifying quota on egress IP (auto-rotating if exhausted)..."
+    ensure_unexhausted_ip 8
     
     sleep 1
     NEW_IP=$(get_proxy_ip)
@@ -479,11 +509,15 @@ case "$1" in
     guard)
         guard
         ;;
+    test|verify|check)
+        echo "==> Testing current IP quota against OpenCode..."
+        ensure_unexhausted_ip 1
+        ;;
     status)
         show_status
         ;;
     *)
-        echo "Usage: opencode-proxy {on|off|rotate|reset|run <args>|guard|status}"
+        echo "Usage: opencode-proxy {on|off|rotate|reset|test|run <args>|guard|status}"
         exit 1
         ;;
 esac
