@@ -59,16 +59,19 @@ for pdir in "${CANDIDATE_DIRS[@]}"; do
     fi
 done
 
-# 5. Enable Proxy and Initial Reset
+# 5. Enable Proxy, Initial Reset & Configure Titles
 echo "==> Initializing WARP Proxy & Randomizing Identifiers..."
 "$TARGET_SCRIPT" on
 "$TARGET_SCRIPT" reset
+"$TARGET_SCRIPT" titles
 
 echo ""
 echo "🎉 Installation successful!"
 echo "Commands available:"
-echo "  opencode-proxy reset    # Rotate IP & randomize identifiers to clear rate limits"
+echo "  opencode-proxy reset    # Rotate IP & randomize identifiers to clear rate limits (with 8-attempt verification)"
 echo "  opencode-proxy rotate   # Rotate IP only"
+echo "  opencode-proxy test     # Actively probe current IP quota against OpenCode DeepSeek v4.1"
+echo "  opencode-proxy titles   # Configure title agent & regenerate descriptive names for untitled sessions"
 echo "  opencode-proxy status   # View current proxy status & randomized profile"
 echo "  opencode-proxy off      # Disable proxy"
 echo "  opencode-proxy on       # Re-enable proxy"

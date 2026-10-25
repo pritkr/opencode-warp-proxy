@@ -103,6 +103,7 @@ opencode-proxy <command>
 | **`reset`** | **Full Privacy & Quota Reset:** Generates a new random project ID, rotates Cloudflare IP, flushes memory caches, restarts daemon, and **actively tests up to 8 IPs** until an unexhausted quota is confirmed. |
 | **`rotate`** | Rotates Cloudflare WARP egress IP and verifies the new IP has fresh quota (retrying automatically if exhausted). |
 | **`test`** | **Quota Diagnostic:** Probes the current egress IP against OpenCode and reports whether quota is active or exhausted. |
+| **`titles`** | **Fix Thread Titles:** Ensures the `title` agent is configured with `deepseek-v4.1-flash-free` and automatically backfills descriptive titles for all untitled sessions. |
 | **`status`** | Displays WARP connection status, Privoxy state, direct & proxy egress IPs, and current active identity profile. |
 | **`on`** | Configures WARP proxy mode, starts Privoxy, sets OpenCode daemon proxy environment variables, and enables the privacy plugin. |
 | **`off`** | Disables proxy environment variables in OpenCode and routes traffic directly. |
@@ -170,6 +171,42 @@ opencode run -m opencode/deepseek-v4.1-flash-free "Your message"
 
 > [!WARNING]
 > Avoid compute-heavy model variants like `#high` or `#max` (e.g. `deepseek-v4.1-flash-free#max`) on the free tier. These variants trigger OpenCode Go subscription requirements (`FreeUsageLimitError`) regardless of IP.
+
+---
+
+## 🏷️ Why OpenCode Thread Titles Were Generic (And How It's Fixed)
+
+If your OpenCode sessions were remaining as `"Untitled session"` or generic timestamps like `"New session - 2026-..."`, here is the exact root cause:
+
+### Root Cause
+OpenCode generates session titles via an internal background agent named `title`. Under the hood, OpenCode resolves which model to use via `SessionContext.selectTitle`:
+1. If `agents.title.model` is not explicitly declared in `opencode.jsonc`, OpenCode attempts fallback discovery via `Model.small(providerID)`.
+2. `Model.small` hardcodes lookup for families: `["gpt-luna", "gemini-flash-lite", "gemini-flash", "claude-haiku"]`.
+3. For the `opencode` provider (e.g. `deepseek-v4.1-flash-free`), none of these model families exist!
+4. The fallback chain fails to resolve any model, causing the title generation task to abort silently and leave threads as generic or untitled.
+
+### The Fix
+Explicitly bind the `title` agent in your `~/.config/opencode/opencode.jsonc`:
+
+```jsonc
+{
+  "model": "opencode/deepseek-v4.1-flash-free",
+  "agents": {
+    "build": {
+      "model": "opencode/deepseek-v4.1-flash-free"
+    },
+    "title": {
+      "model": "opencode/deepseek-v4.1-flash-free"
+    }
+  }
+}
+```
+
+You can automate this configuration and backfill all past untitled sessions with one command:
+
+```bash
+opencode-proxy titles
+```
 
 ---
 

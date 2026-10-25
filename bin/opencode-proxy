@@ -457,23 +457,108 @@ run_with_auto_rotate() {
     
     while [[ $attempt -le $max_retries ]]; do
         local output
-        local status=0
+        local local_rc=0
         
-        output=$("$OPENCODE_BIN" "$@" 2>&1) || status=$?
+        output=$("$OPENCODE_BIN" "$@" 2>&1) || local_rc=$?
         
-        if [[ $status -ne 0 ]] && echo "$output" | grep -qi "Free usage limit reached"; then
+        if [[ $local_rc -ne 0 ]] && echo "$output" | grep -qi "Free usage limit reached"; then
             echo "⚠️  Free usage limit reached on current IP (Attempt $attempt/$max_retries)"
             echo "🔄 Auto-rotating Cloudflare WARP IP to reset quota..."
             rotate_ip
             attempt=$((attempt + 1))
         else
             echo "$output"
-            return $status
+            return $local_rc
         fi
     done
     
     echo "❌ Still rate limited after $max_retries automatic rotations."
     return 1
+}
+
+# ------------------------------------------------------------------------------
+# OpenCode Title Generation & Agent Configuration
+# ------------------------------------------------------------------------------
+configure_title_agent() {
+    echo "==> Ensuring OpenCode thread title agent is properly configured..."
+    local config_paths=(
+        "$HOME/.config/opencode/opencode.jsonc"
+        "$HOME/.opencode/opencode.jsonc"
+        "${XDG_CONFIG_HOME:-$HOME/.config}/opencode/opencode.jsonc"
+    )
+    
+    local updater_script='
+import sys, re
+
+path = sys.argv[1]
+try:
+    with open(path, "r", encoding="utf-8") as f:
+        content = f.read()
+except Exception:
+    content = "{}\n"
+
+if re.search(r"\"title\"\s*:\s*\{[^}]*\"model\"", content):
+    print("✓ Title agent already configured in " + path)
+    sys.exit(0)
+
+if "\"agents\"" in content:
+    new_content = re.sub(
+        r"(\"agents\"\s*:\s*\{)",
+        r"\1\n    \"title\": {\n      \"model\": \"opencode/deepseek-v4.1-flash-free\"\n    },",
+        content,
+        count=1
+    )
+else:
+    new_content = re.sub(
+        r"\{",
+        "{\n  \"agents\": {\n    \"title\": {\n      \"model\": \"opencode/deepseek-v4.1-flash-free\"\n    }\n  },",
+        content,
+        count=1
+    )
+
+with open(path, "w", encoding="utf-8") as f:
+    f.write(new_content)
+print("✓ Configured title agent in " + path)
+'
+
+    for p in "${config_paths[@]}"; do
+        if [[ -f "$p" ]]; then
+            python3 -c "$updater_script" "$p" 2>/dev/null || true
+            break
+        fi
+    done
+    
+    "$OPENCODE_BIN" service restart >/dev/null 2>&1 || true
+}
+
+backfill_session_titles() {
+    echo "==> Backfilling titles for untitled/generic OpenCode sessions..."
+    python3 -c '
+import json, subprocess, time
+
+res = subprocess.run(["opencode", "api", "get", "/api/session"], capture_output=True, text=True)
+try:
+    data = json.loads(res.stdout)
+except Exception:
+    sys.exit(0)
+
+sessions = data.get("data", [])
+untitled = [s for s in sessions if not s.get("title") or s.get("title", "").startswith("New session")]
+print(f"Found {len(untitled)} untitled/generic sessions. Regenerating descriptive titles...")
+
+for s in untitled:
+    sid = s["id"]
+    subprocess.run(["opencode", "api", "patch", f"/api/session/{sid}", "-d", "{\"title\":\"\"}"], capture_output=True)
+    time.sleep(1.2)
+    check = subprocess.run(["opencode", "api", "get", f"/api/session/{sid}"], capture_output=True, text=True)
+    try:
+        t = json.loads(check.stdout).get("data", {}).get("title")
+        if t:
+            print(f"  ✓ {sid}: {t}")
+    except Exception:
+        pass
+' 2>/dev/null || true
+    echo "✓ Session title backfill complete."
 }
 
 ensure_symlinks() {
@@ -513,11 +598,15 @@ case "$1" in
         echo "==> Testing current IP quota against OpenCode..."
         ensure_unexhausted_ip 1
         ;;
+    fix-titles|titles)
+        configure_title_agent
+        backfill_session_titles
+        ;;
     status)
         show_status
         ;;
     *)
-        echo "Usage: opencode-proxy {on|off|rotate|reset|test|run <args>|guard|status}"
+        echo "Usage: opencode-proxy {on|off|rotate|reset|test|titles|run <args>|guard|status}"
         exit 1
         ;;
 esac
