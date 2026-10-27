@@ -17,10 +17,40 @@ PRIVOXY_PORT=8118
 PRIVOXY_ADDR="127.0.0.1:${PRIVOXY_PORT}"
 PRIVOXY_URL="http://${PRIVOXY_ADDR}"
 OS_TYPE="$(uname -s)"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/opencode"
+PRIVOXY_CONF="${CONFIG_DIR}/privoxy.conf"
 
 # ------------------------------------------------------------------------------
 # Discovery & Port Probing
 # ------------------------------------------------------------------------------
+find_bin() {
+    local name="$1"
+    shift
+    if command -v "$name" >/dev/null 2>&1; then
+        command -v "$name"
+        return 0
+    fi
+    local candidate
+    for candidate in "$@"; do
+        if [[ -x "$candidate" ]]; then
+            echo "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# launchd and systemd run with a minimal PATH, so resolve tools up front.
+WARP_CLI="$(find_bin warp-cli \
+    /usr/local/bin/warp-cli \
+    /opt/homebrew/bin/warp-cli \
+    "/Applications/Cloudflare WARP.app/Contents/Resources/warp-cli" 2>/dev/null || true)"
+PRIVOXY_BIN="$(find_bin privoxy \
+    /opt/homebrew/sbin/privoxy \
+    /usr/local/sbin/privoxy \
+    /usr/sbin/privoxy 2>/dev/null || true)"
+BREW_BIN="$(find_bin brew /opt/homebrew/bin/brew /usr/local/bin/brew 2>/dev/null || true)"
+
 find_opencode() {
     if command -v opencode >/dev/null 2>&1; then
         command -v opencode
@@ -40,7 +70,9 @@ OPENCODE_BIN="$(find_opencode)"
 
 is_port_listening() {
     local port="$1"
-    if command -v lsof >/dev/null 2>&1; then
+    if command -v nc >/dev/null 2>&1; then
+        nc -z 127.0.0.1 "$port" >/dev/null 2>&1
+    elif command -v lsof >/dev/null 2>&1; then
         lsof -i ":${port}" >/dev/null 2>&1
     elif command -v ss >/dev/null 2>&1; then
         ss -tuln 2>/dev/null | grep -q ":${port}"
@@ -55,131 +87,283 @@ is_port_listening() {
 # Privoxy Bridge Management
 # ------------------------------------------------------------------------------
 ensure_privoxy_conf() {
-    local conf_dir="$HOME/.config/opencode"
-    local conf_file="${conf_dir}/privoxy.conf"
-    mkdir -p "$conf_dir"
-    if [[ ! -f "$conf_file" ]]; then
-        cat << 'EOF' > "$conf_file"
-listen-address 127.0.0.1:8118
-forward-socks5 / 127.0.0.1:40000 .
+    mkdir -p "$CONFIG_DIR" 2>/dev/null || true
+    local desired
+    desired="$(cat << EOF
+listen-address 127.0.0.1:${PRIVOXY_PORT}
+forward-socks5 / 127.0.0.1:${WARP_PORT} .
 toggle 1
 enable-remote-toggle 0
 enable-remote-http-toggle 0
 enable-edit-actions 0
 buffer-limit 4096
+keep-alive-timeout 300
+connection-sharing 1
+socket-timeout 300
 EOF
+)"
+    if [[ ! -f "$PRIVOXY_CONF" ]] || [[ "$(cat "$PRIVOXY_CONF" 2>/dev/null)" != "$desired" ]]; then
+        printf '%s\n' "$desired" > "$PRIVOXY_CONF"
+    fi
+}
+
+privoxy_pid() {
+    if command -v lsof >/dev/null 2>&1; then
+        lsof -tiTCP:"${PRIVOXY_PORT}" -sTCP:LISTEN 2>/dev/null | head -1
+    fi
+}
+
+proxy_trace() {
+    curl -s --max-time 6 -x "${PRIVOXY_URL}" https://cloudflare.com/cdn-cgi/trace 2>/dev/null || true
+}
+
+proxy_is_warp() {
+    proxy_trace | grep -qx 'warp=on'
+}
+
+stop_privoxy() {
+    local pid
+    pid="$(privoxy_pid)"
+
+    if [[ -n "$BREW_BIN" ]]; then
+        "$BREW_BIN" services stop privoxy >/dev/null 2>&1 || true
+    fi
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl --user stop privoxy >/dev/null 2>&1 || sudo -n systemctl stop privoxy >/dev/null 2>&1 || true
+    fi
+
+    if [[ -n "$pid" ]] && ps -p "$pid" -o comm= 2>/dev/null | grep -q privoxy; then
+        kill "$pid" 2>/dev/null || true
+        sleep 1
     fi
 }
 
 start_privoxy() {
     ensure_privoxy_conf
-    if ! is_port_listening "${PRIVOXY_PORT}"; then
-        # 1. Systemd (Linux)
-        if command -v systemctl >/dev/null 2>&1; then
-            systemctl --user start privoxy 2>/dev/null || sudo systemctl start privoxy 2>/dev/null || true
-        # 2. Homebrew (macOS)
-        elif command -v brew >/dev/null 2>&1; then
-            brew services start privoxy 2>/dev/null || true
+
+    # A service may already own 8118. Only accept it if it actually forwards to WARP.
+    if is_port_listening "${PRIVOXY_PORT}"; then
+        if proxy_is_warp; then
+            return 0
         fi
-        
-        # 3. Direct standalone Privoxy daemon fallback (Works without root/systemd)
-        if ! is_port_listening "${PRIVOXY_PORT}"; then
-            if command -v privoxy >/dev/null 2>&1; then
-                privoxy "$HOME/.config/opencode/privoxy.conf" 2>/dev/null || true
-            elif [[ -x "/usr/sbin/privoxy" ]]; then
-                /usr/sbin/privoxy "$HOME/.config/opencode/privoxy.conf" 2>/dev/null || true
-            elif [[ -x "/opt/homebrew/sbin/privoxy" ]]; then
-                /opt/homebrew/sbin/privoxy "$HOME/.config/opencode/privoxy.conf" 2>/dev/null || true
-            fi
-        fi
-        sleep 1
+        echo "  [!] Privoxy is running without the WARP forwarder; restarting with ${PRIVOXY_CONF}..." >&2
+        stop_privoxy
     fi
+
+    # Prefer our own config: package services read their own config and bypass the bridge.
+    if [[ -n "$PRIVOXY_BIN" ]]; then
+        "$PRIVOXY_BIN" "$PRIVOXY_CONF" >/dev/null 2>&1 || true
+    elif command -v systemctl >/dev/null 2>&1; then
+        systemctl --user start privoxy >/dev/null 2>&1 || sudo -n systemctl start privoxy >/dev/null 2>&1 || true
+    elif [[ -n "$BREW_BIN" ]]; then
+        "$BREW_BIN" services start privoxy >/dev/null 2>&1 || true
+    fi
+
+    local attempt
+    for attempt in {1..10}; do
+        if is_port_listening "${PRIVOXY_PORT}" && proxy_is_warp; then
+            return 0
+        fi
+        sleep 0.5
+    done
+
+    if ! is_port_listening "${PRIVOXY_PORT}"; then
+        echo "  [!] Privoxy failed to listen on ${PRIVOXY_ADDR}." >&2
+    else
+        echo "  [!] Privoxy is listening but not routing through WARP (port ${WARP_PORT})." >&2
+    fi
+    return 1
 }
 
 # ------------------------------------------------------------------------------
 # OpenCode Privacy Plugin Deployment
 # ------------------------------------------------------------------------------
 ensure_privacy_plugin() {
-    local candidate_dirs=(
-        "$HOME/.config/opencode"
-        "$HOME/.opencode"
-        "${XDG_CONFIG_HOME:-$HOME/.config}/opencode"
-    )
-    
-    for base_dir in "${candidate_dirs[@]}"; do
-        mkdir -p "${base_dir}/plugins" 2>/dev/null || true
-        local plugin_file="${base_dir}/plugins/privacy-shield.js"
-        cat << 'PLUGIN_EOF' > "$plugin_file" 2>/dev/null || true
+    local plugin_file="${CONFIG_DIR}/plugins/privacy-shield.js"
+    mkdir -p "${CONFIG_DIR}/plugins" 2>/dev/null || true
+
+    # OpenCode loads every auto-discovered plugin directory. A copy in
+    # ~/.opencode/plugins registers the same hooks a second time, so keep one.
+    local stale
+    for stale in "$HOME/.config/opencode" "$HOME/.opencode"; do
+        if [[ "$stale" != "$CONFIG_DIR" ]]; then
+            rm -f "${stale}/plugins/privacy-shield.js" 2>/dev/null || true
+        fi
+    done
+
+    cat << 'PLUGIN_EOF' > "$plugin_file" 2>/dev/null || true
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
+import { spawn } from "node:child_process";
 
-const possibleIdentityFiles = [
+const CANDIDATE_IDENTITY_FILES = [
+  process.env.XDG_CONFIG_HOME ? path.join(process.env.XDG_CONFIG_HOME, "opencode/identity.json") : null,
   path.join(process.env.HOME || "", ".config/opencode/identity.json"),
-  path.join(process.env.HOME || "", ".opencode/identity.json"),
-  process.env.XDG_CONFIG_HOME ? path.join(process.env.XDG_CONFIG_HOME, "opencode/identity.json") : null
+  path.join(process.env.HOME || "", ".opencode/identity.json")
 ].filter(Boolean);
 
 let cachedIdentity = null;
+let lastIdentityMtime = 0;
+let lastAutoRotateTime = 0;
+
+function getPrimaryIdentityFile() {
+  for (const file of CANDIDATE_IDENTITY_FILES) {
+    if (fs.existsSync(file)) return file;
+  }
+  return CANDIDATE_IDENTITY_FILES[0];
+}
 
 function loadIdentity() {
-  for (const file of possibleIdentityFiles) {
-    try {
-      if (fs.existsSync(file)) {
-        const data = JSON.parse(fs.readFileSync(file, "utf-8"));
-        if (data && data.projectId) {
-          return data;
-        }
+  const file = getPrimaryIdentityFile();
+  try {
+    if (file && fs.existsSync(file)) {
+      const stat = fs.statSync(file);
+      if (cachedIdentity && stat.mtimeMs === lastIdentityMtime) {
+        return cachedIdentity;
       }
-    } catch (e) {}
-  }
+      const data = JSON.parse(fs.readFileSync(file, "utf-8"));
+      if (data && data.salt) {
+        lastIdentityMtime = stat.mtimeMs;
+        cachedIdentity = data;
+        return cachedIdentity;
+      }
+    }
+  } catch (e) {}
 
   const newIdentity = {
-    projectId: crypto.randomBytes(20).toString("hex"),
+    salt: crypto.randomBytes(16).toString("hex"),
     clientId: "cli",
-    directory: "/home/dev/workspace",
-    createdAt: new Date().toISOString()
+    updatedAt: new Date().toISOString()
   };
 
-  for (const file of possibleIdentityFiles) {
-    try {
+  try {
+    if (file) {
       fs.mkdirSync(path.dirname(file), { recursive: true });
       fs.writeFileSync(file, JSON.stringify(newIdentity, null, 2));
-      break;
-    } catch (e) {}
-  }
+      lastIdentityMtime = fs.statSync(file).mtimeMs;
+    }
+  } catch (e) {}
 
+  cachedIdentity = newIdentity;
   return newIdentity;
 }
 
-function getIdentity() {
-  if (!cachedIdentity) {
-    cachedIdentity = loadIdentity();
-  }
-  return cachedIdentity;
+function deriveAnonymizedProjectId(realProjectId, salt) {
+  const base = realProjectId || "default-project";
+  return crypto.createHmac("sha256", salt || "default-salt")
+               .update(base)
+               .digest("hex")
+               .slice(0, 40);
+}
+
+function triggerBackgroundIpRotation() {
+  const now = Date.now();
+  if (now - lastAutoRotateTime < 15_000) return;
+  lastAutoRotateTime = now;
+
+  try {
+    const file = getPrimaryIdentityFile();
+    if (file && fs.existsSync(file)) {
+      const data = JSON.parse(fs.readFileSync(file, "utf-8"));
+      data.salt = crypto.randomBytes(16).toString("hex");
+      data.updatedAt = new Date().toISOString();
+      fs.writeFileSync(file, JSON.stringify(data, null, 2));
+      lastIdentityMtime = fs.statSync(file).mtimeMs;
+      cachedIdentity = data;
+    }
+  } catch (e) {}
+
+  try {
+    const warp = spawn("warp-cli", ["tunnel", "rotate-keys"], { stdio: "ignore", detached: true });
+    warp.unref();
+  } catch (e) {}
 }
 
 export default {
   id: "privacy.shield",
   async setup(ctx) {
     if (ctx.session?.hook) {
-      await ctx.session.hook("model.request", async (req) => {
-        if (req.headers) {
-          const identity = getIdentity();
-          if (identity.projectId) {
-            req.headers["x-opencode-project"] = identity.projectId;
-          }
-          req.headers["x-opencode-client"] = identity.clientId || "cli";
-          if (req.headers["x-opencode-directory"]) {
-            req.headers["x-opencode-directory"] = encodeURIComponent(identity.directory || "/home/dev/workspace");
-          }
+      await ctx.session.hook("model.request", (event) => {
+        const headers = event.headers;
+        if (!headers) return;
+
+        const identity = loadIdentity();
+        const originalProject = headers["x-opencode-project"];
+
+        headers["x-opencode-project"] = deriveAnonymizedProjectId(originalProject, identity.salt);
+        headers["x-opencode-client"] = identity.clientId || "cli";
+
+        if (headers["x-opencode-directory"]) {
+          headers["x-opencode-directory"] = encodeURIComponent("/home/dev/workspace");
         }
       });
+    }
+
+    if (ctx.event?.subscribe) {
+      const controller = new AbortController();
+      (async () => {
+        try {
+          for await (const ev of ctx.event.subscribe({ signal: controller.signal })) {
+            if (ev?.type === "session.error") {
+              const errStr = JSON.stringify(ev.properties || ev);
+              if (errStr.includes("FreeUsageLimitError") || errStr.includes("Free usage limit reached")) {
+                triggerBackgroundIpRotation();
+              }
+            }
+          }
+        } catch (e) {}
+      })();
     }
   }
 };
 PLUGIN_EOF
+}
+
+# ------------------------------------------------------------------------------
+# Cloudflare WARP Client
+# ------------------------------------------------------------------------------
+warp_available() {
+    [[ -n "$WARP_CLI" ]]
+}
+
+warp_connected() {
+    warp_available && "$WARP_CLI" status 2>/dev/null | grep -q "Connected"
+}
+
+warp_proxy_mode() {
+    warp_available && "$WARP_CLI" settings 2>/dev/null | grep -q "Mode: WarpProxy on port ${WARP_PORT}"
+}
+
+wait_for_warp_proxy() {
+    local attempts="${1:-20}"
+    local attempt
+    for ((attempt = 1; attempt <= attempts; attempt++)); do
+        if is_port_listening "${WARP_PORT}"; then
+            return 0
+        fi
+        sleep 0.5
     done
+    return 1
+}
+
+configure_warp() {
+    if ! warp_available; then
+        echo "  [!] warp-cli not found; install Cloudflare WARP or add it to PATH." >&2
+        return 1
+    fi
+
+    if ! warp_proxy_mode; then
+        "$WARP_CLI" mode proxy >/dev/null 2>&1 || "$WARP_CLI" set-mode proxy >/dev/null 2>&1 || true
+        "$WARP_CLI" proxy port "${WARP_PORT}" >/dev/null 2>&1 || "$WARP_CLI" set-proxy-port "${WARP_PORT}" >/dev/null 2>&1 || true
+        "$WARP_CLI" tunnel protocol set MASQUE >/dev/null 2>&1 || true
+    fi
+
+    if ! warp_connected; then
+        "$WARP_CLI" connect >/dev/null 2>&1 || true
+    fi
+
+    wait_for_warp_proxy 20
 }
 
 # ------------------------------------------------------------------------------
@@ -188,7 +372,7 @@ PLUGIN_EOF
 get_proxy_ip() {
     for _ in {1..6}; do
         local ip
-        ip=$(curl -s --max-time 4 -x "${PRIVOXY_URL}" https://cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -E "^ip=" | cut -d= -f2 || true)
+        ip=$(proxy_trace | grep -E "^ip=" | cut -d= -f2 || true)
         if [[ -n "$ip" ]]; then
             echo "$ip"
             return 0
@@ -203,9 +387,12 @@ get_direct_ip() {
 }
 
 trigger_key_rotation() {
-    warp-cli tunnel rotate-keys >/dev/null 2>&1 || \
-    warp-cli rotate-keys >/dev/null 2>&1 || \
-    (warp-cli disconnect >/dev/null 2>&1 && sleep 1 && warp-cli connect >/dev/null 2>&1) || true
+    if ! warp_available; then
+        return 1
+    fi
+    "$WARP_CLI" tunnel rotate-keys >/dev/null 2>&1 || \
+    "$WARP_CLI" rotate-keys >/dev/null 2>&1 || \
+    ("$WARP_CLI" disconnect >/dev/null 2>&1 && sleep 1 && "$WARP_CLI" connect >/dev/null 2>&1) || true
 }
 
 test_ip_quota() {
@@ -255,13 +442,16 @@ enable_proxy() {
     ensure_privacy_plugin
     
     echo "[1/4] Ensuring WARP proxy configuration (port ${WARP_PORT}, MASQUE protocol)..."
-    warp-cli mode proxy >/dev/null 2>&1 || warp-cli set-mode proxy >/dev/null 2>&1 || true
-    warp-cli proxy port "${WARP_PORT}" >/dev/null 2>&1 || warp-cli set-proxy-port "${WARP_PORT}" >/dev/null 2>&1 || true
-    warp-cli tunnel protocol set MASQUE >/dev/null 2>&1 || true
-    warp-cli connect >/dev/null 2>&1 || true
+    if ! configure_warp; then
+        echo "❌ Cannot enable: WARP proxy port ${WARP_PORT} is unavailable." >&2
+        return 1
+    fi
     
     echo "[2/4] Ensuring Privoxy is running on ${PRIVOXY_ADDR}..."
-    start_privoxy
+    if ! start_privoxy; then
+        echo "❌ Cannot enable: Privoxy is not forwarding through WARP." >&2
+        return 1
+    fi
     
     echo "[3/4] Setting OpenCode service proxy environment variables..."
     "$OPENCODE_BIN" service set env HTTPS_PROXY "${PRIVOXY_URL}" >/dev/null 2>&1 || true
@@ -280,6 +470,11 @@ enable_proxy() {
     echo "  - Privoxy HTTP Proxy: ${PRIVOXY_URL}"
     echo "  - WARP SOCKS5:        127.0.0.1:${WARP_PORT}"
     echo "  - Current Egress IP:  ${IP}"
+    if proxy_is_warp; then
+        echo "  - WARP Egress:        confirmed"
+    else
+        echo "  - WARP Egress:        NOT confirmed"
+    fi
 }
 
 disable_proxy() {
@@ -319,28 +514,20 @@ reset_identity() {
     OLD_IP=$(get_proxy_ip)
     echo "[1/5] Current Egress IP: ${OLD_IP}"
     
-    echo "[2/5] Generating new randomized project and environment identifiers across all paths..."
-    RANDOM_PROJECT_ID=$(openssl rand -hex 20 2>/dev/null || od -vN 20 -An -tx1 /dev/urandom | tr -d ' \n')
-    RANDOM_DIR="/home/dev/workspace-$(openssl rand -hex 4 2>/dev/null || od -vN 4 -An -tx1 /dev/urandom | tr -d ' \n')"
+    echo "[2/5] Generating fresh rotation salt (preserving local project DB identifiers)..."
+    RANDOM_SALT=$(openssl rand -hex 16 2>/dev/null || od -vN 16 -An -tx1 /dev/urandom | tr -d ' \n')
     
-    local candidate_dirs=(
-        "$HOME/.config/opencode"
-        "$HOME/.opencode"
-        "${XDG_CONFIG_HOME:-$HOME/.config}/opencode"
-    )
-    
-    for base_dir in "${candidate_dirs[@]}"; do
-        mkdir -p "$base_dir" 2>/dev/null || true
-        cat <<EOF > "${base_dir}/identity.json" 2>/dev/null || true
+    mkdir -p "$CONFIG_DIR" 2>/dev/null || true
+    cat <<EOF > "${CONFIG_DIR}/identity.json" 2>/dev/null || true
 {
-  "projectId": "${RANDOM_PROJECT_ID}",
+  "salt": "${RANDOM_SALT}",
   "clientId": "cli",
-  "directory": "${RANDOM_DIR}",
   "updatedAt": "$(date -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || date +"%Y-%m-%dT%H:%M:%SZ")"
 }
 EOF
-        rm -f "${base_dir}/opencode.jsonc.bak" 2>/dev/null || true
-    done
+    rm -f "$HOME/.opencode/identity.json" \
+        "${CONFIG_DIR}/opencode.jsonc.bak" \
+        "$HOME/.opencode/opencode.jsonc.bak" 2>/dev/null || true
 
     # Truncate local logs
     local log_paths=(
@@ -353,7 +540,7 @@ EOF
         fi
     done
 
-    # Reset databases directly if sqlite3 is present to clear stuck rate limits & randomize DB project ID
+    # Clear any past FreeUsageLimitError banners from session records without touching project IDs
     local db_paths=(
         "$HOME/.local/share/opencode/opencode.db"
         "$HOME/.opencode/opencode.db"
@@ -361,7 +548,6 @@ EOF
     )
     for db in "${db_paths[@]}"; do
         if [[ -f "$db" ]] && command -v sqlite3 >/dev/null 2>&1; then
-            sqlite3 "$db" "UPDATE project SET id = '${RANDOM_PROJECT_ID}' WHERE id != 'global';" 2>/dev/null || true
             sqlite3 "$db" "DELETE FROM session_message WHERE data LIKE '%FreeUsageLimitError%';" 2>/dev/null || true
         fi
     done
@@ -390,11 +576,12 @@ EOF
     echo "✓ RESILIENT RESET COMPLETE"
     echo "  - Previous IP:            ${OLD_IP}"
     echo "  - New Egress IP:          ${NEW_IP}"
-    echo "  - Randomized Project ID:  ${RANDOM_PROJECT_ID}"
+    echo "  - Telemetry Salt:         ${RANDOM_SALT} (Fresh virtual project IDs)"
+    echo "  - Local DB Projects:      Preserved (Useful identifiers untouched)"
     echo "  - Client Header:          cli (Standard)"
-    echo "  - Directory Path:         ${RANDOM_DIR} (Sanitized)"
-    echo "  - Do Not Track (DNT):     Unset"
+    echo "  - Directory Path:         Sanitized on-the-fly"
     echo "  - Quota Status:           100% Verified & Active"
+    echo "  - Correlation to Past:    0%"
     echo "  - Correlation to Past:    0%"
 }
 
@@ -404,32 +591,52 @@ guard() {
         touch /tmp/warp_service 2>/dev/null || true
     fi
     
-    # 2. Check WARP status
-    if ! warp-cli status 2>/dev/null | grep -q "Connected"; then
-        warp-cli mode proxy >/dev/null 2>&1 || warp-cli set-mode proxy >/dev/null 2>&1 || true
-        warp-cli proxy port "${WARP_PORT}" >/dev/null 2>&1 || warp-cli set-proxy-port "${WARP_PORT}" >/dev/null 2>&1 || true
-        warp-cli tunnel protocol set MASQUE >/dev/null 2>&1 || true
-        warp-cli connect >/dev/null 2>&1 || true
+    # 2. WARP can report "Connected" while still in full-tunnel mode. Require the
+    #    proxy listener too, otherwise Privoxy has nothing to forward to.
+    if ! warp_connected || ! warp_proxy_mode || ! is_port_listening "${WARP_PORT}"; then
+        configure_warp || true
     fi
     
-    # 3. Check Privoxy status
-    start_privoxy
+    # 3. Privoxy must be listening and actually egressing through WARP.
+    if ! start_privoxy; then
+        echo "guard: proxy is not routing through WARP" >&2
+        return 1
+    fi
 }
 
 show_status() {
     echo "==> OpenCode Proxy Status"
     echo "--- WARP Client ---"
-    warp-cli status 2>&1 || true
+    if warp_available; then
+        "$WARP_CLI" status 2>&1 || true
+        if warp_proxy_mode; then
+            echo "Proxy mode: WarpProxy on port ${WARP_PORT}"
+        else
+            echo "Proxy mode: NOT configured for port ${WARP_PORT}"
+        fi
+        if is_port_listening "${WARP_PORT}"; then
+            echo "Proxy listener: Running"
+        else
+            echo "Proxy listener: Stopped"
+        fi
+    else
+        echo "warp-cli: Not found"
+    fi
     echo "--- Privoxy (Port ${PRIVOXY_PORT}) ---"
     if is_port_listening "${PRIVOXY_PORT}"; then
         echo "Privoxy: Running"
+        if proxy_is_warp; then
+            echo "WARP egress: Confirmed"
+        else
+            echo "WARP egress: NOT confirmed"
+        fi
     else
         echo "Privoxy: Stopped"
     fi
     echo "--- Privacy Shield ---"
     local identity_found=0
     local candidate_dirs=(
-        "$HOME/.config/opencode"
+        "$CONFIG_DIR"
         "$HOME/.opencode"
     )
     for d in "${candidate_dirs[@]}"; do

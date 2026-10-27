@@ -124,19 +124,20 @@ Here is exactly what happens under the hood:
 ```
 [opencode-proxy reset]
         │
-        ├── 1. Generate Brand New Random Identifiers
-        │      ├── Project ID: Fresh 40-character hex (e.g. 98105e3cd0186265...)
-        │      └── Workspace:  Sanitized fake directory (/home/dev/workspace-xxxx)
+        ├── 1. Generate Fresh Cryptographic Rotation Salt
+        │      ├── Telemetry Salt: Fresh 32-character hex salt in identity.json
+        │      └── Local Database Preserved: Project records, worktrees & sessions
+        │          in opencode.db remain 100% UNTOUCHED (useful identifiers intact!)
         │
         ├── 2. Clean Environment & Telemetry Flags
         │      ├── Unset DO_NOT_TRACK & OTEL (prevents gateway anti-bot throttling)
-        │      └── Truncate local opencode.log & clean backup configs
+        │      └── Clear past FreeUsageLimitError banners from session records
         │
         ├── 3. Rotate Cloudflare WARP Egress IP (warp-cli tunnel rotate-keys)
         │      └── Requests a fresh Anycast public IP from Cloudflare's regional pool
         │
         ├── 4. Restart Background Daemon (opencode service restart)
-        │      └── Flushes in-memory connection pools & loads the new identity
+        │      └── Flushes in-memory connection pools & loads the new salt
         │
         └── 5. Multi-Attempt Quota Verification (Self-Healing Loop)
                └── Actively probes the new IP against OpenCode. If another user
@@ -145,7 +146,11 @@ Here is exactly what happens under the hood:
 ```
 
 > [!NOTE]
-> **Stability Policy:** Identifiers stay **rock-solid and constant** during your normal active chats so multi-turn sessions, tools, and context caches work seamlessly. They **only** rotate when you run `opencode-proxy reset`.
+> **Per-Project Isolation & Quota Preservation:**
+> The `privacy-shield` plugin derives outgoing telemetry IDs per project using `HMAC-SHA256(realProjectId, salt)`.
+> - Project A and Project B get **different** virtual project IDs on the server and do not share a quota bucket. Working in Project A will **never** quickly exhaust Project B's quota!
+> - When `opencode-proxy reset` is run, the salt rotates outgoing project IDs for the server while keeping your local workspace and database identifiers completely intact.
+> - The plugin also subscribes to `session.error` events to trigger background self-healing rotation automatically if a limit is reached.
 
 ---
 

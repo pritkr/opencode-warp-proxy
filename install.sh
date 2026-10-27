@@ -45,17 +45,21 @@ fi
 chmod +x "$TARGET_SCRIPT"
 ln -sf "$TARGET_SCRIPT" "$HOME/.opencode/bin/opencode-proxy" 2>/dev/null || true
 
-# 4. Deploy Privacy Plugin across candidate directories
-CANDIDATE_DIRS=(
-    "$HOME/.config/opencode/plugins"
-    "$HOME/.opencode/plugins"
-    "${XDG_CONFIG_HOME:-$HOME/.config}/opencode/plugins"
-)
+# 4. Deploy the privacy plugin once. OpenCode auto-loads every plugin directory,
+#    so extra copies would register duplicate hooks.
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/opencode"
+PLUGIN_DIR="${CONFIG_DIR}/plugins"
+mkdir -p "$PLUGIN_DIR" 2>/dev/null || true
 
-for pdir in "${CANDIDATE_DIRS[@]}"; do
-    mkdir -p "$pdir" 2>/dev/null || true
-    if [[ -f "./plugins/privacy-shield.js" ]]; then
-        cp -f "./plugins/privacy-shield.js" "${pdir}/privacy-shield.js" 2>/dev/null || true
+if [[ -f "./plugins/privacy-shield.js" ]]; then
+    cp -f "./plugins/privacy-shield.js" "${PLUGIN_DIR}/privacy-shield.js" 2>/dev/null || true
+else
+    curl -fsSL "https://raw.githubusercontent.com/pritkr/opencode-warp-proxy/main/plugins/privacy-shield.js" -o "${PLUGIN_DIR}/privacy-shield.js" 2>/dev/null || true
+fi
+
+for stale_dir in "$HOME/.config/opencode/plugins" "$HOME/.opencode/plugins"; do
+    if [[ "$stale_dir" != "$PLUGIN_DIR" ]]; then
+        rm -f "${stale_dir}/privacy-shield.js" 2>/dev/null || true
     fi
 done
 
